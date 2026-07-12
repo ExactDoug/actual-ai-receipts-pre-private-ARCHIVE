@@ -1,7 +1,6 @@
 import cron from 'node-cron';
 import crypto from 'crypto';
 import fs from 'fs';
-import * as actualApiClient from '@actual-app/api';
 import {
   cronSchedule, isFeatureEnabled, password, serverURL, budgetId,
   e2ePassword, dataDir, llmProvider, openaiModel, openaiBaseURL,
@@ -10,6 +9,7 @@ import {
 import actualAi from './src/container';
 import {
   transactionProcessor as txProcessor,
+  classificationStore,
   receiptFetchService,
   receiptStore,
   connectorRegistry,
@@ -18,11 +18,16 @@ import {
   splitTransactionService,
   batchService,
 } from './src/container';
-import ClassificationStore from './src/web/classification-store';
 import { createWebServer } from './src/web/server';
 import type { UnifiedResponse, APICategoryEntity, APICategoryGroupEntity, RuleDescription } from './src/types';
-import type { TransactionEntity } from '@actual-app/api/@types/loot-core/src/types/models';
+import type { TransactionEntity, RuleEntity } from '@actual-app/api/@types/loot-core/src/types/models';
 import { transformRulesToDescriptions } from './src/utils/rule-utils';
+import ActualBudgetConnection from './src/actual-budget-connection';
+
+// Shared persistent connection to Actual Budget (replaces createTempApiService for web requests)
+const budgetConnection = new ActualBudgetConnection({
+  serverURL, password, budgetId, e2ePassword, dataDir,
+});
 
 const REVIEW_UI_PORT = parseInt(process.env.REVIEW_UI_PORT ?? '3000', 10);
 const REVIEW_UI_ENABLED = process.env.REVIEW_UI_ENABLED !== 'false';
@@ -32,7 +37,6 @@ if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
-const classificationStore = new ClassificationStore(dataDir);
 let currentRunId = '';
 
 // Wire the classification callback to capture LLM results
@@ -80,12 +84,22 @@ txProcessor.setOnClassified(
   },
 );
 
-// Classification runner
+// Helper to read automation settings from SQLite
+function autoSetting(key: string, defaultValue = true): boolean {
+  return receiptStore.getSettingBool(key, defaultValue);
+}
+
+// Classification runner — each step gated by persistent settings
 async function runClassification() {
+  if (!autoSetting('cron.enabled')) {
+    console.log('[cron] Skipping — cron.enabled is false');
+    return;
+  }
+
   currentRunId = crypto.randomUUID();
 
-  // Fetch receipts and run matching before classification
-  if (isFeatureEnabled('receiptMatching')) {
+  // Step 1: Fetch receipts from Veryfi
+  if (isFeatureEnabled('receiptMatching') && autoSetting('cron.autoFetchReceipts')) {
     try {
       const fetchResult = await receiptFetchService.fetchAll();
       if (fetchResult.errors.length > 0) {
@@ -94,46 +108,31 @@ async function runClassification() {
     } catch (err) {
       console.error('Receipt fetch failed (continuing with classification):', err);
     }
+  }
 
+  // Step 2: Match receipts to transactions
+  if (isFeatureEnabled('receiptMatching') && autoSetting('cron.autoMatchReceipts')) {
     try {
-      // Get uncategorized transactions for matching
-      const tempApi = await createTempApiService();
-      try {
-        const accounts = await tempApi.getAccounts();
-        let transactions: TransactionEntity[] = [];
-        for (const account of accounts) {
-          transactions = transactions.concat(
-            await tempApi.getTransactions(account.id, '1990-01-01', '2030-01-01'),
-          );
-        }
-        // Build payee ID → name lookup
-        const payees = await tempApi.getPayees();
-        const payeeMap = new Map<string, string>();
-        for (const p of payees) {
-          if (p.id && p.name) payeeMap.set(p.id, p.name);
-        }
-        // Match receipts against all non-split transactions (including already-categorized ones).
-        // Matches to already-categorized transactions are flagged as overridesExisting
-        // and require explicit user approval before applying.
-        const matchable = transactions.filter((t) => !t.is_parent && t.amount !== 0);
-        matchingService.matchAll(matchable.map((t) => ({
-          id: t.id,
-          amount: t.amount,
-          date: t.date,
-          payee: t.payee ? payeeMap.get(t.payee) : undefined,
-          imported_payee: t.imported_payee ?? undefined,
-          hasCategory: !!t.category,
-          categoryId: t.category ?? undefined,
-        })));
-      } finally {
-        await tempApi.shutdown();
-      }
+      const { transactions, payeeMap } = await budgetConnection.getAllTransactionsForMatching();
+      const matchable = transactions.filter((t) => !t.is_parent && t.amount !== 0);
+      matchingService.matchAll(matchable.map((t) => ({
+        id: t.id,
+        amount: t.amount,
+        date: t.date,
+        payee: t.payee ? payeeMap.get(t.payee) : undefined,
+        imported_payee: t.imported_payee ?? undefined,
+        hasCategory: !!t.category,
+        categoryId: t.category ?? undefined,
+      })));
     } catch (err) {
       console.error('Receipt matching failed (continuing with classification):', err);
     }
   }
 
-  await actualAi.classify();
+  // Step 3: LLM transaction classification
+  if (autoSetting('cron.autoClassifyTransactions')) {
+    await actualAi.classify();
+  }
 }
 
 // Start cron
@@ -144,12 +143,8 @@ if (!isFeatureEnabled('classifyOnStartup') && !cron.validate(cronSchedule)) {
   }
 }
 
-let cronTask: ReturnType<typeof cron.schedule> | null = null;
-let cronEnabled = true;
-
 if (cron.validate(cronSchedule)) {
-  cronTask = cron.schedule(cronSchedule, async () => {
-    if (!cronEnabled) return;
+  cron.schedule(cronSchedule, async () => {
     await runClassification();
   });
 }
@@ -172,32 +167,30 @@ if (REVIEW_UI_ENABLED) {
 
     async onApply(classifications) {
       // Apply approved classifications to Actual Budget
-      const apiService = await createTempApiService();
       let applied = 0;
       let skipped = 0;
       const appliedIds: string[] = [];
 
-      try {
-        for (const c of classifications) {
-          try {
-            const taggedNotes = `${c.notes ? c.notes + ' ' : ''}${guessedTag}`;
-            await apiService.updateTransaction(c.transactionId, {
-              notes: taggedNotes,
-              category: c.suggestedCategoryId,
-            });
-            appliedIds.push(c.id);
-            applied++;
-          } catch (err) {
-            console.error(`Failed to apply classification ${c.id}:`, err);
-            skipped++;
-          }
+      for (const c of classifications) {
+        try {
+          const taggedNotes = `${c.notes ? c.notes + ' ' : ''}${guessedTag}`;
+          await budgetConnection.updateTransaction(c.transactionId, {
+            notes: taggedNotes,
+            category: c.suggestedCategoryId,
+          });
+          appliedIds.push(c.id);
+          classificationStore.clearWriteError(c.id);
+          applied++;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Failed to apply classification ${c.id}:`, msg);
+          classificationStore.setWriteError(c.id, msg);
+          skipped++;
         }
+      }
 
-        if (appliedIds.length > 0) {
-          classificationStore.markApplied(appliedIds);
-        }
-      } finally {
-        await apiService.shutdown();
+      if (appliedIds.length > 0) {
+        classificationStore.markApplied(appliedIds);
       }
 
       return { applied, skipped };
@@ -209,23 +202,7 @@ if (REVIEW_UI_ENABLED) {
     },
 
     async getCategories() {
-      const apiService = await createTempApiService();
-      try {
-        const groups = await apiService.getCategoryGroups();
-        const result: { id: string; name: string; group: string }[] = [];
-        for (const group of groups) {
-          if ('categories' in group && Array.isArray(group.categories)) {
-            for (const cat of group.categories as { id: string; name: string }[]) {
-              result.push({ id: cat.id, name: cat.name, group: group.name ?? '' });
-            }
-          }
-        }
-        await apiService.shutdown();
-        return result;
-      } catch (err) {
-        await apiService.shutdown();
-        throw err;
-      }
+      return budgetConnection.getCategories();
     },
 
     receiptStore: isFeatureEnabled('receiptMatching') ? receiptStore : undefined,
@@ -264,12 +241,12 @@ if (REVIEW_UI_ENABLED) {
 
     onReceiptApplySplit: isFeatureEnabled('receiptMatching')
       ? async (matchId: string) => {
-        const apiService = await createTempApiService();
-        try {
+        await budgetConnection.withApi(async () => {
           await splitTransactionService.applySplit(matchId);
-        } finally {
-          await apiService.shutdown();
-        }
+        });
+        // Evict cached transaction data for this match
+        const match = receiptStore.getMatch(matchId);
+        if (match) budgetConnection.evict(match.transactionId as string);
       }
       : undefined,
 
@@ -283,12 +260,11 @@ if (REVIEW_UI_ENABLED) {
 
     onReceiptRollback: isFeatureEnabled('receiptMatching')
       ? async (matchId: string) => {
-        const apiService = await createTempApiService();
-        try {
+        const match = receiptStore.getMatch(matchId);
+        await budgetConnection.withApi(async () => {
           await splitTransactionService.rollbackSplit(matchId);
-        } finally {
-          await apiService.shutdown();
-        }
+        });
+        if (match) budgetConnection.evict(match.transactionId as string);
       }
       : undefined,
 
@@ -321,39 +297,22 @@ if (REVIEW_UI_ENABLED) {
 
     onResetAndRematch: isFeatureEnabled('receiptMatching')
       ? async () => {
-        // Step 1: Reset all non-applied matches
         const { reset, preserved, errors: resetErrors } = batchService.resetForRematch();
 
-        // Step 2: Fetch fresh transactions and re-run matching
-        const tempApi = await createTempApiService();
-        try {
-          const accounts = await tempApi.getAccounts();
-          let transactions: TransactionEntity[] = [];
-          for (const account of accounts) {
-            transactions = transactions.concat(
-              await tempApi.getTransactions(account.id, '1990-01-01', '2030-01-01'),
-            );
-          }
-          const payees = await tempApi.getPayees();
-          const payeeMap = new Map<string, string>();
-          for (const p of payees) {
-            if (p.id && p.name) payeeMap.set(p.id, p.name);
-          }
-          const matchable = transactions.filter((t) => !t.is_parent && t.amount !== 0);
-          const rematchSummary = matchingService.matchAll(matchable.map((t) => ({
-            id: t.id,
-            amount: t.amount,
-            date: t.date,
-            payee: t.payee ? payeeMap.get(t.payee) : undefined,
-            imported_payee: t.imported_payee ?? undefined,
-            hasCategory: !!t.category,
-            categoryId: t.category ?? undefined,
-          })));
+        const { transactions, payeeMap } = await budgetConnection.getAllTransactionsForMatching();
+        const matchable = transactions.filter((t) => !t.is_parent && t.amount !== 0);
+        const rematchSummary = matchingService.matchAll(matchable.map((t) => ({
+          id: t.id,
+          amount: t.amount,
+          date: t.date,
+          payee: t.payee ? payeeMap.get(t.payee) : undefined,
+          imported_payee: t.imported_payee ?? undefined,
+          hasCategory: !!t.category,
+          categoryId: t.category ?? undefined,
+        })));
 
-          return { reset, preserved, resetErrors, rematchSummary };
-        } finally {
-          await tempApi.shutdown();
-        }
+        budgetConnection.invalidateAll();
+        return { reset, preserved, resetErrors, rematchSummary };
       }
       : undefined,
 
@@ -369,178 +328,11 @@ if (REVIEW_UI_ENABLED) {
       : undefined,
 
     async getTransactionDetails(transactionId: string) {
-      const apiService = await createTempApiService();
-      try {
-        const accounts = await apiService.getAccounts();
-        const accountMap = new Map<string, string>();
-        let allTransactions: TransactionEntity[] = [];
-        for (const account of accounts) {
-          if (account.id && account.name) accountMap.set(account.id, account.name);
-          allTransactions = allTransactions.concat(
-            await apiService.getTransactions(account.id, '1990-01-01', '2030-01-01'),
-          );
-        }
-        const tx = allTransactions.find((t) => t.id === transactionId);
-        if (!tx) return null;
-
-        // Build payee and category lookups
-        const payees = await apiService.getPayees();
-        const payeeMap = new Map<string, string>();
-        for (const p of payees) {
-          if (p.id && p.name) payeeMap.set(p.id, p.name);
-        }
-        const groups = await apiService.getCategoryGroups();
-        const catMap = new Map<string, string>();
-        for (const group of groups) {
-          if ('categories' in group && Array.isArray(group.categories)) {
-            for (const cat of group.categories as { id: string; name: string }[]) {
-              catMap.set(cat.id, cat.name);
-            }
-          }
-        }
-
-        const dateStr = String(tx.date ?? '');
-        const formattedDate = /^\d{8}$/.test(dateStr)
-          ? `${dateStr.slice(0, 4)}-${dateStr.slice(4, 6)}-${dateStr.slice(6, 8)}`
-          : dateStr;
-
-        const result: {
-          amount?: number;
-          date?: string;
-          payeeName?: string;
-          importedPayee?: string;
-          accountName?: string;
-          categoryId?: string;
-          categoryName?: string;
-          isParent?: boolean;
-          subtransactions?: { amount: number; categoryId?: string; categoryName?: string }[];
-        } = {
-          amount: tx.amount,
-          date: formattedDate,
-          payeeName: tx.payee ? payeeMap.get(tx.payee) ?? '' : '',
-          importedPayee: tx.imported_payee ?? '',
-          accountName: (tx as unknown as { account?: string }).account
-            ? accountMap.get((tx as unknown as { account: string }).account) ?? ''
-            : '',
-        };
-
-        if (tx.is_parent) {
-          result.isParent = true;
-          const subs = allTransactions.filter((t) => t.parent_id === tx.id);
-          result.subtransactions = subs.map((s) => ({
-            amount: s.amount,
-            categoryId: s.category ?? undefined,
-            categoryName: s.category ? catMap.get(s.category) : undefined,
-          }));
-        } else if (tx.category) {
-          result.categoryId = tx.category;
-          result.categoryName = catMap.get(tx.category);
-        }
-
-        return result;
-      } finally {
-        await apiService.shutdown();
-      }
+      return budgetConnection.getTransactionDetails(transactionId);
     },
 
     async getTransactionsBulk(transactionIds: string[]) {
-      const apiService = await createTempApiService();
-      try {
-        const accounts = await apiService.getAccounts();
-        const accountMap = new Map<string, string>();
-        let allTransactions: TransactionEntity[] = [];
-        for (const account of accounts) {
-          if (account.id && account.name) accountMap.set(account.id, account.name);
-          allTransactions = allTransactions.concat(
-            await apiService.getTransactions(account.id, '1990-01-01', '2030-01-01'),
-          );
-        }
-
-        const payees = await apiService.getPayees();
-        const payeeMap = new Map<string, string>();
-        for (const p of payees) {
-          if (p.id && p.name) payeeMap.set(p.id, p.name);
-        }
-        const groups = await apiService.getCategoryGroups();
-        const catMap = new Map<string, string>();
-        for (const group of groups) {
-          if ('categories' in group && Array.isArray(group.categories)) {
-            for (const cat of group.categories as { id: string; name: string }[]) {
-              catMap.set(cat.id, cat.name);
-            }
-          }
-        }
-
-        // Build account lookup from transactions (account field is the account ID)
-        const txAccountMap = new Map<string, string>();
-        for (const tx of allTransactions) {
-          const acctId = (tx as unknown as { account?: string }).account;
-          if (acctId) txAccountMap.set(tx.id, acctId);
-        }
-
-        const requestedSet = new Set(transactionIds);
-        const result: Record<string, {
-          amount?: number;
-          date?: string;
-          payeeName?: string;
-          importedPayee?: string;
-          accountName?: string;
-          categoryId?: string;
-          categoryName?: string;
-          isParent?: boolean;
-          subtransactions?: { amount: number; categoryId?: string; categoryName?: string }[];
-        }> = {};
-
-        for (const tx of allTransactions) {
-          if (!requestedSet.has(tx.id)) continue;
-
-          const dateStr = String(tx.date ?? '');
-          const formattedDate = /^\d{8}$/.test(dateStr)
-            ? `${dateStr.slice(0, 4)}-${dateStr.slice(4, 6)}-${dateStr.slice(6, 8)}`
-            : dateStr;
-
-          const acctId = txAccountMap.get(tx.id);
-          const entry: typeof result[string] = {
-            amount: tx.amount,
-            date: formattedDate,
-            payeeName: tx.payee ? payeeMap.get(tx.payee) ?? '' : '',
-            importedPayee: tx.imported_payee ?? '',
-            accountName: acctId ? accountMap.get(acctId) ?? '' : '',
-          };
-
-          if (tx.is_parent) {
-            entry.isParent = true;
-            const subs = allTransactions.filter((t) => t.parent_id === tx.id);
-            entry.subtransactions = subs.map((s) => ({
-              amount: s.amount,
-              categoryId: s.category ?? undefined,
-              categoryName: s.category ? catMap.get(s.category) : undefined,
-            }));
-          } else if (tx.category) {
-            entry.categoryId = tx.category;
-            entry.categoryName = catMap.get(tx.category);
-          }
-
-          result[tx.id] = entry;
-        }
-
-        return result;
-      } finally {
-        await apiService.shutdown();
-      }
-    },
-
-    getCronStatus() {
-      return {
-        enabled: cronEnabled,
-        schedule: cronSchedule,
-        lastRunId: currentRunId ?? undefined,
-      };
-    },
-
-    setCronEnabled(enabled: boolean) {
-      cronEnabled = enabled;
-      return cronEnabled;
+      return budgetConnection.getTransactionsBulk(transactionIds);
     },
 
     getConfig() {
@@ -551,7 +343,6 @@ if (REVIEW_UI_ENABLED) {
         serverURL,
         budgetId,
         cronSchedule,
-        cronEnabled,
         dryRun: isFeatureEnabled('dryRun'),
         features: {
           classifyOnStartup: isFeatureEnabled('classifyOnStartup'),
@@ -571,43 +362,26 @@ if (REVIEW_UI_ENABLED) {
 
 // Helper to fetch categories, groups, and rules for classification operations
 async function fetchClassificationContext() {
-  const apiService = await createTempApiService();
-  const groups = await apiService.getCategoryGroups();
-  const payees = await apiService.getPayees();
-  const rules = await apiService.getRules();
+  const groups = await budgetConnection.getCategoryGroups() as { id?: string; name?: string; categories?: { id: string; name: string }[] }[];
+  const payeeMap = await budgetConnection.getPayees();
+  const payees = [...payeeMap.entries()].map(([id, name]) => ({ id, name }));
+  const rules = await budgetConnection.getRules() as RuleEntity[];
   const flatCats: { id: string; name: string; group?: string }[] = [];
   const groupsForPrompt: { id: string; name: string; categories: { id: string; name: string }[] }[] = [];
   for (const group of groups) {
     const cats: { id: string; name: string }[] = [];
-    if ('categories' in group && Array.isArray(group.categories)) {
-      for (const cat of group.categories as { id: string; name: string }[]) {
+    if (group.categories && Array.isArray(group.categories)) {
+      for (const cat of group.categories) {
         flatCats.push({ id: cat.id, name: cat.name, group: group.name ?? '' });
         cats.push({ id: cat.id, name: cat.name });
       }
     }
     groupsForPrompt.push({ id: group.id ?? '', name: group.name ?? '', categories: cats });
   }
-  const ruleDescriptions = transformRulesToDescriptions(rules, groups, payees);
-  return { flatCats, groupsForPrompt, ruleDescriptions, shutdown: () => apiService.shutdown() };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ruleDescriptions = transformRulesToDescriptions(rules as any, groups as any, payees as any);
+  return { flatCats, groupsForPrompt, ruleDescriptions, shutdown: () => Promise.resolve() };
 }
 
 // Helper to create a temporary API connection for applying classifications
-async function createTempApiService(): Promise<typeof actualApiClient> {
-  const applyDir = dataDir + 'apply/';
-  if (!fs.existsSync(applyDir)) {
-    fs.mkdirSync(applyDir, { recursive: true });
-  }
-  await actualApiClient.init({
-    dataDir: applyDir,
-    serverURL,
-    password,
-  });
-
-  if (e2ePassword) {
-    await actualApiClient.downloadBudget(budgetId, { password: e2ePassword });
-  } else {
-    await actualApiClient.downloadBudget(budgetId);
-  }
-
-  return actualApiClient;
-}
+// createTempApiService removed — all web requests now use budgetConnection
